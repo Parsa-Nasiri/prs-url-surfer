@@ -47,33 +47,31 @@ pending = load_pending()   # chat_id -> {"action": "...", ...}
 
 # ---------- Rubika API helper ----------
 def api(method, payload=None, files=None):
-    """Calls Rubika Bot API and returns `result` field if successful, else None."""
     url = f"{BASE}/{TOKEN}/{method}"
     try:
         if files:
-            # sendDocument expects a multipart upload
             resp = requests.post(url, files=files, timeout=30)
         else:
             resp = requests.post(url, json=payload or {}, timeout=30)
 
-        logger.info(f"API {method} → HTTP {resp.status_code}")
+        print(f"\n=== DEBUG {method} ===")
+        print(f"HTTP {resp.status_code}")
+        print(f"Body → {resp.text[:500]}")
 
-        # Parse response
         try:
             data = resp.json()
         except Exception:
-            logger.error(f"Invalid JSON from {method}: {resp.text[:300]}")
+            print("❌ Invalid JSON")
             return None
 
-        # Check status
         if data.get("status") != "OK":
-            logger.error(f"API error in {method}: {json.dumps(data, ensure_ascii=False)}")
+            print(f"❌ API error: {data}")
             return None
 
         return data.get("result", {})
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Request failed for {method}: {e}")
+        print(f"Request failed: {e}")
         return None
 
 def send_message(chat_id, text, inline_keypad=None):
