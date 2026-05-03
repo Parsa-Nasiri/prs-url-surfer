@@ -1,4 +1,4 @@
-import json, logging, os, re, sys, time, asyncio
+import json, logging, os, re, sys, time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from datetime import datetime, timedelta
@@ -6,11 +6,9 @@ from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("RubikaBot")
 
-# ---------- Config ----------
 TOKEN = os.getenv("RUBIKA_BOT_TOKEN", "YOUR_BOT_TOKEN")
 GH_TOKEN = os.getenv("GH_PAT", "")
 REPO = os.getenv("GITHUB_REPOSITORY", "owner/repo")
@@ -20,24 +18,19 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 STATE_FILE = Path("state.json")
 CONFIG_FILE = Path("config.json")
 
-# Time constants
 JOB_LIMIT_HOURS = 6
-RESTART_BEFORE = 20              # minutes
-RUN_DURATION = (JOB_LIMIT_HOURS * 60) - RESTART_BEFORE   # 340 min
-POLL_INTERVAL = 5                # seconds
+RESTART_BEFORE = 20
+RUN_DURATION = (JOB_LIMIT_HOURS * 60) - RESTART_BEFORE
+POLL_INTERVAL = 5
 
-# ---------- State ----------
 def load_json(path, default):
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return default
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
 def save_json(obj, path):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 state = load_json(STATE_FILE, {"offset_id": None})
 
-# ---------- API helpers ----------
 def api_call(method, data=None, files=None):
     url = f"{BASE}/{TOKEN}/{method}"
     try:
@@ -56,19 +49,12 @@ def send_message(chat_id, text, inline_keypad=None):
         payload["inline_keypad"] = inline_keypad
     return api_call("sendMessage", payload)
 
-def edit_message_text(chat_id, msg_id, text, inline_keypad=None):
-    payload = {"chat_id": str(chat_id), "message_id": str(msg_id), "text": text}
-    if inline_keypad:
-        payload["inline_keypad"] = inline_keypad
-    return api_call("editMessageText", payload)
-
 def get_updates():
     data = {"limit": 10}
     if state.get("offset_id"):
         data["offset_id"] = state["offset_id"]
     return api_call("getUpdates", data)
 
-# ---------- Helpers ----------
 def download_to_path(url, path):
     try:
         r = requests.get(url, timeout=30)
@@ -130,24 +116,17 @@ def combine_html(html, assets):
     return str(soup)
 
 def build_inline_keypad(buttons):
-    """buttons: list of list of (id, text)"""
     rows = []
     for row in buttons:
         rows.append({"buttons": [{"id": bid, "type": "Simple", "button_text": bt} for bid, bt in row]})
     return {"rows": rows}
 
-# ---------- Core logic ----------
-pending_actions = load_json(CONFIG_FILE, {})   # chat_id -> {"action": "...", "url": "..."}
+pending_actions = load_json(CONFIG_FILE, {})
 
 def handle_message(update):
-    msg = update.get("new_message", {})
-    chat_id = msg.get("chat_id")
+    msg = update["new_message"]
+    chat_id = msg["chat_id"]
     text = msg.get("text", "").strip()
-    msg_id = msg.get("message_id")
-    if not chat_id or not text:
-        return
-
-    # Pending action?
     if chat_id in pending_actions:
         action = pending_actions.pop(chat_id)
         save_json(pending_actions, CONFIG_FILE)
@@ -157,32 +136,23 @@ def handle_message(update):
             return handle_combine(chat_id, text)
         elif action["action"] == "download":
             return handle_direct_download(chat_id, text)
-
-    # Commands
     if text.startswith("/start"):
-        return start(chat_id)
+        start(chat_id)
     elif text.startswith(("http://", "https://")):
-        return prompt_user(chat_id, text)
+        prompt_user(chat_id, text)
     else:
-        send_message(chat_id, "⚠️ لطفاً یک لینک معتبر (با http یا https) بفرستید یا /start را بزنید.")
+        send_message(chat_id, "⚠️ لطفاً یک لینک معتبر بفرستید یا /start")
 
 def handle_callback(update):
-    cb = update.get("callback_data", {})
-    data = cb.get("data", "")
-    chat_id = cb.get("chat_id")
-    msg_id = cb.get("message_id")
-    if not data or not chat_id:
-        return
-
+    cb = update["callback_data"]
+    data = cb["data"]
+    chat_id = cb["chat_id"]
     if data.startswith("combine|"):
-        url = data[len("combine|"):]
-        return handle_combine(chat_id, url, msg_id)
+        return handle_combine(chat_id, data[len("combine|"):])
     elif data.startswith("extract|"):
-        url = data[len("extract|"):]
-        return handle_extract(chat_id, url, msg_id)
+        return handle_extract(chat_id, data[len("extract|"):])
     elif data.startswith("download_asset|"):
-        url = data[len("download_asset|"):]
-        return download_asset(chat_id, url)
+        return download_asset(chat_id, data[len("download_asset|"):])
     elif data == "download_url":
         pending_actions[chat_id] = {"action": "download"}
         save_json(pending_actions, CONFIG_FILE)
@@ -190,64 +160,58 @@ def handle_callback(update):
     elif data == "download_webpage":
         pending_actions[chat_id] = {"action": "combine"}
         save_json(pending_actions, CONFIG_FILE)
-        return send_message(chat_id, "🌍 لطفاً آدرس صفحه وب مورد نظر را ارسال کنید:")
+        return send_message(chat_id, "🌍 لطفاً آدرس صفحه وب را ارسال کنید:")
     elif data == "extract_sources":
         pending_actions[chat_id] = {"action": "extract"}
         save_json(pending_actions, CONFIG_FILE)
-        return send_message(chat_id, "📦 لطفاً آدرس صفحه‌ای که می‌خواهید منابع آن استخراج شود را بفرستید:")
+        return send_message(chat_id, "📦 لطفاً آدرس صفحه را بفرستید:")
     elif data == "help":
-        return send_message(chat_id, "🔰 راهنما:\n• /start : شروع\n• ارسال لینک مستقیم : دانلود فایل\n• ارسال لینک صفحه : انتخاب ترکیب یا استخراج")
+        return send_message(chat_id, "🔰 راهنما:\n• /start\n• ارسال لینک مستقیم\n• ارسال لینک صفحه")
 
-# ---------- Actions ----------
 def start(chat_id):
     keypad = build_inline_keypad([
-        [("download_url", "🌐 دانلود فایل از URL"), ("download_webpage", "📄 ترکیب صفحه وب")],
+        [("download_url", "🌐 دانلود فایل"), ("download_webpage", "📄 ترکیب صفحه")],
         [("extract_sources", "📦 استخراج منابع"), ("help", "❓ راهنما")],
     ])
-    send_message(chat_id, "سلام! 👋 به ربات هوشمند دانلودر خوش آمدید.\nلطفاً یک گزینه را انتخاب کنید:", keypad)
+    send_message(chat_id, "سلام! 👋 به ربات هوشمند دانلودر خوش آمدید.", keypad)
 
 def prompt_user(chat_id, url):
     keypad = build_inline_keypad([
-        [("combine|" + url, "📄 ترکیب صفحه وب"), ("extract|" + url, "📦 استخراج منابع")],
+        [("combine|" + url, "📄 ترکیب صفحه"), ("extract|" + url, "📦 استخراج")],
     ])
-    send_message(chat_id, "چه کاری می‌خواهید انجام دهید؟", keypad)
+    send_message(chat_id, "چه کاری انجام دهم؟", keypad)
 
 def handle_direct_download(chat_id, url):
-    send_message(chat_id, "⏳ در حال دریافت فایل...")
+    send_message(chat_id, "⏳ در حال دریافت...")
     name = Path(urlparse(url).path).name or "file"
     path = DOWNLOAD_DIR / name
     if download_to_path(url, path):
-        send_message(chat_id, f"✅ فایل با موفقیت دانلود شد:\n`{name}`\n(مسیر: {path})")
+        send_message(chat_id, f"✅ فایل ذخیره شد:\n`{name}`")
     else:
-        send_message(chat_id, "❌ خطا در دانلود فایل.")
+        send_message(chat_id, "❌ خطا در دانلود.")
 
 def handle_combine(chat_id, url, msg_id=None):
-    send_message(chat_id, "🌐 در حال تحلیل و ترکیب صفحه...")
+    send_message(chat_id, "🌐 در حال ترکیب صفحه...")
     html = fetch_html(url)
     if not html:
-        return send_message(chat_id, "❌ دریافت صفحه ناموفق بود.")
+        return send_message(chat_id, "❌ صفحه دریافت نشد.")
     assets = parse_assets(html, url)
     combined = combine_html(html, assets)
     domain = urlparse(url).netloc.replace(".", "_")
     filepath = DOWNLOAD_DIR / f"{domain}_combined.html"
     filepath.write_text(combined, encoding="utf-8")
-    send_message(chat_id, f"📄 صفحه وب ترکیبی ذخیره شد:\n`{filepath}`")
+    send_message(chat_id, f"📄 صفحه ترکیبی:\n`{filepath}`")
 
 def handle_extract(chat_id, url, msg_id=None):
-    send_message(chat_id, "🔎 در حال استخراج منابع...")
+    send_message(chat_id, "🔎 استخراج منابع...")
     html = fetch_html(url)
     if not html:
-        return send_message(chat_id, "❌ دریافت صفحه شکست خورد.")
+        return send_message(chat_id, "❌ صفحه دریافت نشد.")
     assets = parse_assets(html, url)
-
-    # Images: send as text list (Rubika v3 API has no media group via sendMessage)
     if assets["images"]:
-        img_list = "\n".join(assets["images"][:10])
-        send_message(chat_id, f"🖼️ تصاویر:\n{img_list}")
+        send_message(chat_id, "🖼️ " + "\n".join(assets["images"][:10]))
     else:
-        send_message(chat_id, "🖼️ هیچ تصویری یافت نشد.")
-
-    # Videos & files
+        send_message(chat_id, "🖼️ هیچ تصویری پیدا نشد.")
     selections = assets["videos"] + assets["files"]
     if selections:
         buttons = []
@@ -255,20 +219,19 @@ def handle_extract(chat_id, url, msg_id=None):
             name = Path(urlparse(src).path).name or "فایل"
             buttons.append([(f"download_asset|{src}", f"⬇️ {name[:25]}")])
         keypad = build_inline_keypad(buttons)
-        send_message(chat_id, "🎬 برای دانلود هر ویدیو یا فایل روی دکمه کلیک کنید:", keypad)
+        send_message(chat_id, "🎬 فایل‌های قابل دانلود:", keypad)
     else:
-        send_message(chat_id, "📭 هیچ ویدیو یا فایل قابل دانلودی یافت نشد.")
+        send_message(chat_id, "📭 فایل قابل دانلودی یافت نشد.")
 
 def download_asset(chat_id, url):
-    send_message(chat_id, "⏳ دریافت فایل...")
+    send_message(chat_id, "⏳ دریافت...")
     name = Path(urlparse(url).path).name or "asset"
     path = DOWNLOAD_DIR / name
     if download_to_path(url, path):
-        send_message(chat_id, f"✅ فایل دانلود شد:\n`{name}`")
+        send_message(chat_id, f"✅ {name}")
     else:
         send_message(chat_id, "❌ دانلود ناموفق.")
 
-# ---------- Auto-restart ----------
 def trigger_restart():
     if not GH_TOKEN:
         return
@@ -280,25 +243,34 @@ def trigger_restart():
     except Exception as e:
         logger.error(f"Dispatch error: {e}")
 
-# ---------- Main loop ----------
 def main():
     deadline = datetime.utcnow() + timedelta(minutes=RUN_DURATION)
     logger.info(f"Bot runs until {deadline} UTC")
+    test = api_call("getMe")
+    if test.get("status") != "OK":
+        logger.error(f"❌ Token invalid: {test}")
+        return
+    logger.info(f"✅ Bot @{test.get('username','?')} started")
+    last_heartbeat = 0
     while datetime.utcnow() < deadline:
         try:
             result = get_updates()
             updates = result.get("updates", [])
+            if updates:
+                logger.info(f"📩 {len(updates)} update(s)")
             for upd in updates:
                 if "new_message" in upd:
                     handle_message(upd)
                 elif "callback_data" in upd:
                     handle_callback(upd)
-                # Track offset
                 if "id" in upd:
                     state["offset_id"] = str(int(upd["id"]) + 1)
             if "next_offset_id" in result:
                 state["offset_id"] = result["next_offset_id"]
             save_json(state, STATE_FILE)
+            if time.time() - last_heartbeat > 60:
+                logger.info("💓 alive")
+                last_heartbeat = time.time()
         except Exception as e:
             logger.error(f"Loop error: {e}")
         time.sleep(POLL_INTERVAL)
