@@ -303,8 +303,10 @@ async def main_loop():
 if __name__ == "__main__":
     try:
         asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
     except Exception as e:
         logger.critical(f"Fatal: {e}", exc_info=True)
         sys.exit(1)
-finally:
-    save_state(pending_actions)
+    finally:
+        save_state(pending_actions)
