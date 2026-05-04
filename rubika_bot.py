@@ -1,70 +1,55 @@
-import asyncio
-import aiohttp
-import json
+"""
+Rubika Smart Downloader Bot
+- Synchronous HTTP with 'requests' library
+- Inline keypad with correct structure (rows → buttons)
+- Button clicks via aux_data.button_id
+- 24/7 cron job compatible with GitHub Actions
+"""
+
 import os
-import re
 import sys
+import re
 import time
-import traceback
-import logging
-import hashlib
+import json
 import base64
+import hashlib
+import logging
+import traceback
 from datetime import datetime
-from urllib.parse import urljoin, urlparse, unquote
 from pathlib import Path
-from typing import List, Dict, Optional, Union
+from urllib.parse import urljoin, urlparse, unquote
+from typing import List, Dict, Optional
+
+import requests
 from bs4 import BeautifulSoup
 
-# Required third-party libraries (install via requirements.txt)
-try:
-    import aiofiles
-    from aiohttp import ClientTimeout
-except ImportError:
-    raise ImportError("Missing dependencies. Install: aiohttp, aiofiles, beautifulsoup4, requests")
-
-# ================= CONFIGURATION =================
+# ==================== CONFIGURATION ====================
 TOKEN = os.getenv("RUBIKA_BOT_TOKEN")
 if not TOKEN:
-    raise RuntimeError("RUBIKA_BOT_TOKEN environment variable is not set.")
+    raise RuntimeError("❌ RUBIKA_BOT_TOKEN environment variable is not set.")
 
 BASE_URL = "https://botapi.rubika.ir/v3"
 DOWNLOAD_DIR = Path("./downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Cron timing (GitHub Actions friendly)
-POLL_INTERVAL = 150               # seconds between API calls
-MAX_RUNTIME = 6 * 3600 - 20 * 60  # 5h 40m (stop 20 min before GitHub's 6h limit)
+# GitHub Actions timing: run 5h40m (20 min before 6h limit), then exit
+# Cron schedule: every 5 minutes → nearly 24/7 coverage
+POLL_INTERVAL = 5          # seconds (as recommended by Rubika docs)
+MAX_RUNTIME = 6 * 3600 - 20 * 60  # 5h 40m
 
-# Optional: admin chat ID for startup / shutdown notifications
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # set this if you want notifications
+# Optional admin chat ID for startup/shutdown notifications
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
-# Inline keypad for the main menu
-MAIN_MENU_KEYPAD = {
-    "rows": [
-        [{"id": "get_sources", "type": "Simple", "button_text": "📥 Get Page Sources"}],
-        [{"id": "download_page", "type": "Simple", "button_text": "🌐 Download Full Webpage"}],
-        [{"id": "help", "type": "Simple", "button_text": "❓ Help"}],
-    ]
-}
-
-# Emojis for a better look
+# ==================== EMOJIS ====================
 ICONS = {
-    "success": "✅",
-    "error": "❌",
-    "warning": "⚠️",
-    "info": "ℹ️",
-    "file": "📄",
-    "image": "🖼️",
-    "video": "🎥",
-    "audio": "🎵",
-    "download": "⬇️",
-    "loading": "⏳",
-    "done": "🎉",
-    "link": "🔗",
-    "folder": "📁",
-    "globe": "🌐",
+    "success": "✅", "error": "❌", "warning": "⚠️", "info": "ℹ️",
+    "file": "📄", "image": "🖼️", "video": "🎥", "audio": "🎵",
+    "download": "⬇️", "loading": "⏳", "done": "🎉", "link": "🔗",
+    "folder": "📁", "globe": "🌐", "robot": "🤖", "star": "⭐",
+    "clock": "🕐", "package": "📦", "wrench": "🔧",
 }
 
+# ==================== LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -72,11 +57,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RubikaBot")
 
-# ================= UTILITY FUNCTIONS =================
-def generate_message_id() -> str:
-    return hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
+# ==================== INLINE KEYPAD TEMPLATES ====================
+def build_keypad(rows: List[List[dict]]) -> dict:
+    """
+    Build a valid Rubika inline_keypad structure.
+    Each row must be: {"buttons": [ ... ]}
+    """
+    return {
+        "rows": [
+            {"buttons": row} for row in rows
+        ]
+    }
+
+MAIN_MENU = build_keypad([
+    [{"id": "get_sources", "type": "Simple", "button_text": "📥 Get Page Sources"}],
+    [{"id": "download_page", "type": "Simple", "button_text": "🌐 Download Full Webpage"}],
+    [{"id": "help", "type": "Simple", "button_text": "❓ Help"}],
+])
+
+# ==================== UTILITY FUNCTIONS ====================
+def clean_filename(url_path: str) -> str:
+    """Create a valid filename from a URL path."""
+    name = url_path.split("/")[-1] or "index.html"
+    name = unquote(name)
+    if "?" in name:
+        name = name.split("?")[0]
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    return name or "download"
+
+def fix_relative_url(base_url: str, relative_url: str) -> str:
+    """Resolve a relative URL against a base URL."""
+    return urljoin(base_url, relative_url)
 
 def format_file_size(size_bytes: int) -> str:
+    """Convert bytes to human-readable format."""
     if size_bytes == 0:
         return "0 B"
     units = ["B", "KB", "MB", "GB"]
@@ -86,94 +100,96 @@ def format_file_size(size_bytes: int) -> str:
         i += 1
     return f"{size_bytes:.2f} {units[i]}"
 
-def clean_filename(url_path: str) -> str:
-    name = url_path.split("/")[-1] or "index.html"
-    name = unquote(name)
-    if "?" in name:
-        name = name.split("?")[0]
-    name = re.sub(r'[<>:"/\\|?*]', "_", name)
-    return name or "download"
-
-def fix_relative_url(base_url: str, relative_url: str) -> str:
-    return urljoin(base_url, relative_url)
-
-# ================= BOT CLASS =================
+# ==================== RUBIKA BOT CLASS ====================
 class RubikaBot:
     def __init__(self, token: str):
         self.token = token
         self.base_url = BASE_URL
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
         self.offset_id: Optional[str] = None
         self.start_time = time.time()
 
-    async def start(self):
-        self.session = aiohttp.ClientSession(
-            timeout=ClientTimeout(total=60),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            await self.main_loop()
-        except Exception as e:
-            logger.error(f"Fatal error in main loop: {e}")
-        finally:
-            await self.session.close()
-
     def is_time_exceeded(self) -> bool:
+        """Check if the bot has run beyond the allowed time (GitHub Actions limit)."""
         return (time.time() - self.start_time) >= MAX_RUNTIME
 
-    # ---------- Rubika API Calls ----------
-    async def call_api(self, method: str, data: dict) -> dict:
+    # ---------- Rubika API Methods ----------
+    def call_api(self, method: str, data: dict) -> dict:
+        """Generic method to call Rubika Bot API."""
         url = f"{self.base_url}/{self.token}/{method}"
         try:
-            async with self.session.post(url, json=data) as resp:
-                return await resp.json()
-        except aiohttp.ClientError as e:
+            resp = self.session.post(url, json=data, timeout=30)
+            return resp.json()
+        except requests.RequestException as e:
             logger.error(f"API call failed ({method}): {e}")
             return {"status": "ERROR", "message": str(e)}
 
-    async def get_updates(self, limit: int = 10) -> List[dict]:
+    def get_updates(self, limit: int = 10) -> List[dict]:
+        """Fetch new updates using Long Polling (offset_id)."""
         data = {"limit": limit}
         if self.offset_id:
             data["offset_id"] = self.offset_id
-        response = await self.call_api("getUpdates", data)
+        response = self.call_api("getUpdates", data)
         updates = response.get("updates", [])
         if response.get("next_offset_id"):
             self.offset_id = response["next_offset_id"]
         return updates
 
-    async def send_message(
+    def send_message(
         self,
         chat_id: str,
         text: str,
         inline_keypad: Optional[dict] = None,
         reply_to_message_id: Optional[str] = None,
     ) -> Optional[str]:
+        """Send a text message, optionally with an inline keypad."""
         data = {"chat_id": chat_id, "text": text}
         if inline_keypad:
             data["inline_keypad"] = inline_keypad
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
-        response = await self.call_api("sendMessage", data)
+
+        response = self.call_api("sendMessage", data)
         if response.get("status") == "OK":
             return response.get("message_id")
         else:
             logger.error(f"sendMessage failed: {response}")
             return None
 
+    def edit_message_keypad(
+        self, chat_id: str, message_id: str, inline_keypad: dict
+    ) -> bool:
+        """Update the inline keypad of an existing message."""
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "inline_keypad": inline_keypad,
+        }
+        response = self.call_api("editMessageKeypad", data)
+        return response.get("status") == "OK"
+
     # ---------- Web Scraping & Download ----------
-    async def fetch_html(self, url: str) -> Optional[str]:
+    def fetch_html(self, url: str) -> Optional[str]:
+        """Fetch HTML content from a URL."""
         try:
-            async with self.session.get(url, timeout=ClientTimeout(30)) as resp:
-                if resp.status == 200:
-                    return await resp.text()
-                else:
-                    logger.warning(f"Fetch {url} returned HTTP {resp.status}")
-                    return None
-        except Exception as e:
+            resp = requests.get(url, timeout=30, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; RubikaBot/1.0)"
+            })
+            if resp.status_code == 200:
+                return resp.text
+            else:
+                logger.warning(f"Fetch {url} returned HTTP {resp.status_code}")
+                return None
+        except requests.RequestException as e:
             logger.error(f"Error fetching {url}: {e}")
             return None
 
-    async def extract_resources(self, url: str, html: str) -> Dict[str, List[str]]:
+    def extract_resources(self, url: str, html: str) -> Dict[str, List[str]]:
+        """
+        Parse HTML and extract links to images, videos, and other files.
+        Returns dict with keys: 'images', 'videos', 'files'.
+        """
         soup = BeautifulSoup(html, "html.parser")
         resources = {"images": [], "videos": [], "files": []}
 
@@ -209,25 +225,32 @@ class RubikaBot:
 
         return resources
 
-    async def download_resource(self, url: str, save_dir: Path) -> Optional[Path]:
+    def download_resource(self, url: str, save_dir: Path) -> Optional[Path]:
+        """Download a single resource and save it locally."""
         try:
             file_name = clean_filename(url)
             file_path = save_dir / file_name
-            async with self.session.get(url, timeout=ClientTimeout(120)) as resp:
-                if resp.status == 200:
-                    content = await resp.read()
-                    async with aiofiles.open(file_path, "wb") as f:
-                        await f.write(content)
-                    return file_path
-                else:
-                    logger.warning(f"Download {url} failed (HTTP {resp.status})")
-                    return None
-        except Exception as e:
+            resp = requests.get(url, stream=True, timeout=120, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; RubikaBot/1.0)"
+            })
+            if resp.status_code == 200:
+                with open(file_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                return file_path
+            else:
+                logger.warning(f"Download {url} failed (HTTP {resp.status_code})")
+                return None
+        except requests.RequestException as e:
             logger.warning(f"Error downloading {url}: {e}")
             return None
 
-    async def download_webpage_embedded(self, url: str) -> Optional[str]:
-        html = await self.fetch_html(url)
+    def download_webpage_embedded(self, url: str) -> Optional[str]:
+        """
+        Download a complete webpage and embed all CSS, JS, and images
+        into a single HTML file. Returns the path to the generated file.
+        """
+        html = self.fetch_html(url)
         if not html:
             return None
 
@@ -245,7 +268,7 @@ class RubikaBot:
             href = link.get("href")
             if href:
                 css_url = fix_relative_url(url, href)
-                css_content = await self.fetch_html(css_url)
+                css_content = self.fetch_html(css_url)
                 if css_content:
                     style_tag = soup.new_tag("style")
                     style_tag.string = css_content
@@ -255,212 +278,305 @@ class RubikaBot:
         for script in soup.find_all("script", src=True):
             src = script["src"]
             js_url = fix_relative_url(url, src)
-            js_content = await self.fetch_html(js_url)
+            js_content = self.fetch_html(js_url)
             if js_content:
                 new_script = soup.new_tag("script")
                 new_script.string = js_content
                 script.replace_with(new_script)
 
-        # Convert images to base64 (optional, can be disabled if too large)
+        # Convert images to base64
         for img in soup.find_all("img", src=True):
             src = img["src"]
             if src.startswith("data:"):
                 continue
             img_url = fix_relative_url(url, src)
             try:
-                async with self.session.get(img_url, timeout=ClientTimeout(30)) as resp:
-                    if resp.status == 200:
-                        content_type = resp.headers.get("Content-Type", "")
-                        if "image" in content_type:
-                            img_data = await resp.read()
-                            b64 = base64.b64encode(img_data).decode()
-                            img["src"] = f"data:{content_type};base64,{b64}"
+                resp = requests.get(img_url, timeout=30, headers={
+                    "User-Agent": "Mozilla/5.0"
+                })
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "image" in content_type:
+                        img_data = resp.content
+                        b64 = base64.b64encode(img_data).decode()
+                        img["src"] = f"data:{content_type};base64,{b64}"
             except Exception:
                 pass
 
         domain = urlparse(url).netloc.replace(".", "_")
         filename = f"{domain}_fullpage_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         filepath = DOWNLOAD_DIR / filename
-        async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
-            await f.write(str(soup))
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(str(soup))
         return str(filepath)
 
-    # ---------- User Interaction ----------
-    async def handle_start(self, chat_id: str):
+    # ---------- User Interaction Handlers ----------
+    def handle_start(self, chat_id: str):
+        """Send welcome message on /start command."""
         text = (
             f"{ICONS['globe']} *Welcome to the Smart Downloader Bot!*\n\n"
-            "I can help you:\n"
+            f"I can help you:\n"
             f"{ICONS['link']} Extract and download resources from any webpage (images, videos, files)\n"
             f"{ICONS['download']} Download a complete webpage with all assets embedded in a single HTML file\n\n"
-            "Send me a URL to begin, or use the menu below."
+            f"Send me a URL to begin, or use the menu below."
         )
-        await self.send_message(chat_id, text, inline_keypad=MAIN_MENU_KEYPAD)
+        self.send_message(chat_id, text, inline_keypad=MAIN_MENU)
 
-    async def handle_url_input(self, chat_id: str, url: str):
+    def handle_url_input(self, chat_id: str, url: str):
+        """
+        Process a URL sent by the user.
+        Extract resources and present options via inline keypads.
+        """
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        await self.send_message(chat_id, f"{ICONS['loading']} Analyzing `{url}`…")
+        self.send_message(chat_id, f"{ICONS['loading']} Analyzing `{url}`…")
 
-        html = await self.fetch_html(url)
+        html = self.fetch_html(url)
         if not html:
-            await self.send_message(chat_id, f"{ICONS['error']} Could not fetch the page.")
+            self.send_message(chat_id, f"{ICONS['error']} Could not fetch the page. Please check the URL.")
             return
 
-        resources = await self.extract_resources(url, html)
+        resources = self.extract_resources(url, html)
         images = resources["images"]
         videos = resources["videos"]
         files = resources["files"]
 
         if not any([images, videos, files]):
-            await self.send_message(
+            self.send_message(
                 chat_id,
-                f"{ICONS['warning']} No downloadable resources found.\n"
-                "You can still download the full page using the menu.",
+                f"{ICONS['warning']} No downloadable resources found on this page.\n"
+                f"You can still download the full webpage using the menu button.",
+                inline_keypad=MAIN_MENU,
             )
             return
 
-        # Show images (thumbnails are not supported natively, so just links)
+        # Images: show first few URLs, offer download button
         if images:
-            await self.send_message(chat_id, f"{ICONS['image']} Found *{len(images)} images*:")
-            for img in images[:5]:  # show first 5
-                await self.send_message(chat_id, f"{ICONS['image']} {img}")
+            self.send_message(chat_id, f"{ICONS['image']} Found *{len(images)} images* on the page:")
+            for img in images[:5]:
+                self.send_message(chat_id, f"{ICONS['image']} {img}")
             if len(images) > 5:
-                await self.send_message(chat_id, f"... and {len(images)-5} more.")
-            keypad = {
-                "rows": [
-                    [{"id": f"dl_images_{url}", "type": "Simple",
-                      "button_text": f"⬇️ Download All Images ({len(images)})"}]
-                ]
-            }
-            await self.send_message(chat_id, "Download these images?", inline_keypad=keypad)
+                self.send_message(chat_id, f"... and {len(images) - 5} more.")
 
-        # Videos and files – require user confirmation
+            download_images_kp = build_keypad([
+                [{"id": f"dl_images|{url}", "type": "Simple",
+                  "button_text": f"⬇️ Download All Images ({len(images)})"}],
+            ])
+            self.send_message(chat_id, "Download all images?", inline_keypad=download_images_kp)
+
+        # Videos and files: offer selection (large files, user confirmation needed)
         if videos or files:
             buttons = []
             if videos:
-                buttons.append([{"id": f"dl_videos_{url}", "type": "Simple",
+                buttons.append([{"id": f"dl_videos|{url}", "type": "Simple",
                                  "button_text": f"🎥 Download All Videos ({len(videos)})"}])
             if files:
-                buttons.append([{"id": f"dl_files_{url}", "type": "Simple",
+                buttons.append([{"id": f"dl_files|{url}", "type": "Simple",
                                  "button_text": f"📁 Download All Files ({len(files)})"}])
             if buttons:
-                await self.send_message(
-                    chat_id,
-                    "Download these media files?",
-                    inline_keypad={"rows": buttons}
-                )
+                media_kp = build_keypad(buttons)
+                self.send_message(chat_id, "Download these media files?", inline_keypad=media_kp)
 
-    async def handle_button_click(self, chat_id: str, button_id: str):
+    def handle_button_click(self, chat_id: str, button_id: str, message_id: Optional[str] = None):
+        """Process inline button clicks (from aux_data.button_id)."""
         if button_id == "get_sources":
-            await self.send_message(chat_id, f"{ICONS['link']} Send me the URL.")
+            self.send_message(chat_id, f"{ICONS['link']} Please send me the URL you want to analyze.")
         elif button_id == "download_page":
-            await self.send_message(chat_id, f"{ICONS['globe']} Send me the webpage URL.")
+            self.send_message(chat_id, f"{ICONS['globe']} Please send me the URL of the webpage you want to download.")
         elif button_id == "help":
             help_text = (
                 f"{ICONS['info']} *How to use this bot:*\n\n"
-                "1. Send a URL to extract resources.\n"
-                "2. Use the buttons to download images, videos, or files.\n"
-                "3. Use 'Download Full Webpage' to get a self-contained HTML.\n\n"
-                "Large files (videos, archives) require confirmation before downloading."
+                f"1. Send a URL to extract resources.\n"
+                f"2. Use the buttons to download images, videos, or files.\n"
+                f"3. Use 'Download Full Webpage' to get a self-contained HTML file.\n\n"
+                f"Large files (videos, archives) require confirmation before downloading."
             )
-            await self.send_message(chat_id, help_text)
-        elif button_id.startswith("dl_images_"):
-            await self.download_category(chat_id, button_id.replace("dl_images_", ""), "images")
-        elif button_id.startswith("dl_videos_"):
-            await self.download_category(chat_id, button_id.replace("dl_videos_", ""), "videos")
-        elif button_id.startswith("dl_files_"):
-            await self.download_category(chat_id, button_id.replace("dl_files_", ""), "files")
+            self.send_message(chat_id, help_text)
+        elif button_id.startswith("dl_images|"):
+            url = button_id.split("|", 1)[1]
+            self.download_category(chat_id, url, "images")
+        elif button_id.startswith("dl_videos|"):
+            url = button_id.split("|", 1)[1]
+            self.download_category(chat_id, url, "videos")
+        elif button_id.startswith("dl_files|"):
+            url = button_id.split("|", 1)[1]
+            self.download_category(chat_id, url, "files")
         else:
-            await self.send_message(chat_id, f"{ICONS['warning']} Unknown action.")
+            self.send_message(chat_id, f"{ICONS['warning']} Unknown action: {button_id}")
 
-    async def download_category(self, chat_id: str, url: str, category: str):
-        html = await self.fetch_html(url)
+    def download_category(self, chat_id: str, url: str, category: str):
+        """Download all resources of a given category (images/videos/files)."""
+        html = self.fetch_html(url)
         if not html:
-            await self.send_message(chat_id, f"{ICONS['error']} Could not refetch the page.")
+            self.send_message(chat_id, f"{ICONS['error']} Failed to refetch the page.")
             return
 
-        resources = await self.extract_resources(url, html)
+        resources = self.extract_resources(url, html)
         items = resources.get(category, [])
         if not items:
-            await self.send_message(chat_id, f"{ICONS['warning']} No {category} found.")
+            self.send_message(chat_id, f"{ICONS['warning']} No {category} found.")
             return
 
-        await self.send_message(chat_id, f"{ICONS['loading']} Starting download of {len(items)} {category}...")
+        self.send_message(chat_id, f"{ICONS['loading']} Starting download of {len(items)} {category}...")
+
         download_dir = DOWNLOAD_DIR / f"{chat_id}_{category}_{int(time.time())}"
         download_dir.mkdir(parents=True, exist_ok=True)
 
         success = 0
         for item_url in items:
-            file_path = await self.download_resource(item_url, download_dir)
+            file_path = self.download_resource(item_url, download_dir)
             if file_path:
                 success += 1
-                # For simplicity, we just notify the user; sending actual files may require rubpy.
-                await self.send_message(chat_id, f"{ICONS['file']} Downloaded: {file_path.name}")
-        await self.send_message(chat_id, f"{ICONS['done']} Download complete! {success}/{len(items)} files saved.")
+                size = format_file_size(file_path.stat().st_size)
+                self.send_message(chat_id, f"{ICONS['file']} Downloaded: `{file_path.name}` ({size})")
+
+        self.send_message(
+            chat_id,
+            f"{ICONS['done']} Download complete! {success}/{len(items)} files saved to:\n"
+            f"`{download_dir}`",
+            inline_keypad=MAIN_MENU,
+        )
+
+    def handle_fullpage_download(self, chat_id: str, url: str):
+        """Handle the 'download full webpage' action."""
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        self.send_message(chat_id, f"{ICONS['loading']} Downloading and embedding assets for `{url}`...\nThis may take a while.")
+
+        filepath = self.download_webpage_embedded(url)
+        if filepath:
+            size = format_file_size(Path(filepath).stat().st_size)
+            self.send_message(
+                chat_id,
+                f"{ICONS['done']} Full webpage saved!\n"
+                f"File: `{Path(filepath).name}`\n"
+                f"Size: {size}\n"
+                f"All CSS, JS, and images have been embedded into a single HTML file.",
+                inline_keypad=MAIN_MENU,
+            )
+        else:
+            self.send_message(
+                chat_id,
+                f"{ICONS['error']} Failed to download the webpage. Please check the URL.",
+                inline_keypad=MAIN_MENU,
+            )
 
     # ---------- Main Loop ----------
-    async def main_loop(self):
-        logger.info(f"Bot started. Will run for approximately {MAX_RUNTIME // 60} minutes.")
-
-        # Optional: notify admin (only if ADMIN_CHAT_ID is set and valid)
-        if ADMIN_CHAT_ID:
-            try:
-                await self.send_message(ADMIN_CHAT_ID, f"Bot online at {datetime.now().isoformat()}")
-            except Exception as e:
-                logger.warning(f"Could not send admin notification: {e}")
-
-        while not self.is_time_exceeded():
-            try:
-                updates = await self.get_updates(limit=10)
-                for update in updates:
-                    await self.process_update(update)
-                await asyncio.sleep(POLL_INTERVAL)
-            except Exception as e:
-                logger.error(f"Error in main loop: {traceback.format_exc()}")
-                await asyncio.sleep(5)
-
-        logger.info("Time limit reached. Shutting down gracefully.")
-        if ADMIN_CHAT_ID:
-            await self.send_message(ADMIN_CHAT_ID, "Bot shutting down (time limit).")
-
-    async def process_update(self, update: dict):
-        chat_id = update.get("chat_id")
-        if not chat_id:
-            return
-
+    def process_update(self, update: dict):
+        """
+        Process a single update from Rubika.
+        The update can be a new message (with optional aux_data for button clicks).
+        """
         update_type = update.get("type")
+        chat_id = update.get("chat_id")
+
+        if not chat_id:
+            return 0
 
         if update_type == "NewMessage":
             new_msg = update.get("new_message")
             if not new_msg:
-                return
+                return 0
+
             text = new_msg.get("text", "").strip()
             sender_type = new_msg.get("sender_type", "User")
+            message_id = new_msg.get("message_id")
+
             if sender_type != "User":
-                return
+                return 0  # Ignore bot's own messages
 
+            # Check for button click via aux_data
+            aux_data = new_msg.get("aux_data")
+            if aux_data and isinstance(aux_data, dict) and aux_data.get("button_id"):
+                button_id = aux_data["button_id"]
+                logger.info(f"Button clicked: {button_id} by {chat_id}")
+                # If it's a download_fullpage button
+                if button_id.startswith("dl_fullpage|"):
+                    url = button_id.split("|", 1)[1]
+                    self.handle_fullpage_download(chat_id, url)
+                else:
+                    self.handle_button_click(chat_id, button_id, message_id)
+                return 1
+
+            # Process text commands
             if text == "/start":
-                await self.handle_start(chat_id)
-            elif re.match(r"https?://\S+", text):
-                await self.handle_url_input(chat_id, text)
-            else:
-                await self.send_message(
+                self.handle_start(chat_id)
+                return 1
+            elif text == "/help":
+                self.send_message(
                     chat_id,
-                    f"{ICONS['info']} Please send a valid URL or use the menu.",
-                    inline_keypad=MAIN_MENU_KEYPAD,
+                    f"{ICONS['robot']} Send me a URL to start!",
+                    inline_keypad=MAIN_MENU,
                 )
+                return 1
 
-        elif update_type == "ButtonClicked":
-            aux_data = update.get("aux_data", {})
-            button_id = aux_data.get("button_id")
-            if button_id:
-                await self.handle_button_click(chat_id, button_id)
+            # Check for URL pattern
+            url_match = re.match(r"https?://\S+", text)
+            if url_match:
+                url = url_match.group(0)
 
-# ================= ENTRY POINT =================
-async def main():
+                # Offer both options
+                choice_kp = build_keypad([
+                    [{"id": f"dl_sources|{url}", "type": "Simple",
+                      "button_text": "📥 Extract Resources"}],
+                    [{"id": f"dl_fullpage|{url}", "type": "Simple",
+                      "button_text": "🌐 Download Full Page"}],
+                ])
+                self.send_message(
+                    chat_id,
+                    f"{ICONS['link']} I detected a URL: `{url}`\n\n"
+                    f"What would you like to do?",
+                    inline_keypad=choice_kp,
+                )
+                return 1
+
+            # Handle dl_sources button
+            if aux_data and isinstance(aux_data, dict) and aux_data.get("button_id"):
+                button_id = aux_data["button_id"]
+                if button_id.startswith("dl_sources|"):
+                    url = button_id.split("|", 1)[1]
+                    self.handle_url_input(chat_id, url)
+                    return 1
+
+            # Unknown input
+            self.send_message(
+                chat_id,
+                f"{ICONS['info']} Please send a valid URL or use the menu.",
+                inline_keypad=MAIN_MENU,
+            )
+            return 1
+
+        return 0
+
+    def run(self):
+        """Main synchronous loop for the bot."""
+        logger.info(f"{ICONS['robot']} Bot started. Will run for ~{MAX_RUNTIME // 60} minutes.")
+        logger.info(f"Polling every {POLL_INTERVAL}s | Token: {self.token[:8]}...")
+
+        if ADMIN_CHAT_ID:
+            self.send_message(ADMIN_CHAT_ID, f"{ICONS['robot']} Bot online at {datetime.now().isoformat()}")
+
+        processed_count = 0
+        while not self.is_time_exceeded():
+            try:
+                updates = self.get_updates(limit=10)
+                for update in updates:
+                    processed_count += self.process_update(update)
+                time.sleep(POLL_INTERVAL)
+            except Exception as e:
+                logger.error(f"Error in main loop: {traceback.format_exc()}")
+                time.sleep(5)
+
+        logger.info(f"{ICONS['clock']} Time limit reached. Processed {processed_count} updates. Shutting down.")
+        if ADMIN_CHAT_ID:
+            self.send_message(ADMIN_CHAT_ID, f"{ICONS['warning']} Bot shutting down (time limit).")
+
+# ==================== GITHUB ACTIONS ENTRY POINT ====================
+def main():
     bot = RubikaBot(TOKEN)
-    await bot.start()
+    bot.run()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
